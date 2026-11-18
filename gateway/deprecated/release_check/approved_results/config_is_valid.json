@@ -1,5 +1,5 @@
 {
-  "stage": "config_lint",
+  "check": "config_is_valid",
   "metrics": {
     "routes": 3,
     "errors": 0

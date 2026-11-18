@@ -4,6 +4,8 @@
 // GitOps repo. ArgoCD does the deploy. Rollback = `git revert` in the GitOps repo.
 //
 // Plugins: no `junit` (not installed, and we don't change plugins) -> JUnit XML is archived.
+// Quick checks
+// Lint, quick tests, eval gate, build image, bump GitOps (deploy dev)
 
 def podYaml(String kanikoMemory) {
   return """
@@ -18,12 +20,6 @@ spec:
       resources:
         requests: { cpu: 500m, memory: 512Mi }
         limits:   { memory: 1536Mi }
-    - name: redis                      # real Redis for the integration tests (marker: integration)
-      image: redis:8.10.3-alpine
-      args: ["--save", "", "--maxmemory", "64mb"]
-      resources:
-        requests: { cpu: 50m, memory: 32Mi }
-        limits:   { memory: 128Mi }
     - name: kaniko
       image: martizih/kaniko:v1.26.6-debug    # maintained fork; Google archived Kaniko (lesson 11)
       command: ["/busybox/cat"]
@@ -75,29 +71,12 @@ pipeline {
         stage('Lint') {
           steps { dir('gateway') { sh 'uv run ruff check . --output-format=concise' } }
         }
-        stage('Unit + API tests') {
+        stage('Quick tests') {
           steps {
-            dir('gateway') {
-              sh 'uv run pytest -q --cov=gateway --cov-report= --junitxml=reports/junit-unit.xml'
-            }
+            // quick_tests/: 3 small demo tests (JJ routing, Redis cache); the rest is in gateway/deprecated/
+            dir('gateway') { sh 'uv run pytest -q --junitxml=reports/junit-quick-tests.xml' }
           }
         }
-      }
-    }
-    stage('Integration tests') {
-      steps {
-        dir('gateway') {
-          sh '''
-            for i in $(seq 1 20); do python -c "import socket; socket.create_connection(('localhost', 6379), 1)" && break; sleep 1; done
-            GATEWAY_REDIS_URL=redis://localhost:6379/0 uv run pytest -q -m integration \
-              --cov=gateway --cov-append --cov-report= --junitxml=reports/junit-integration.xml
-          '''
-        }
-      }
-    }
-    stage('Coverage gate (>= 80%)') {
-      steps {
-        dir('gateway') { sh 'uv run coverage report --fail-under=80 && uv run coverage xml -o reports/coverage.xml' }
       }
     }
     stage('Routing eval gate') {

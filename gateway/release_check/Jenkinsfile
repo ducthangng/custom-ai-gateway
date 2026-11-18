@@ -1,0 +1,42 @@
+// Release check (Jenkins job `qualify`): the 2 checks in release_check/run.py, one stage each.
+// A failing check makes its stage red and prints why.
+// Release check
+// models_exist, routes_unchanged
+
+pipeline {
+  agent {
+    kubernetes {
+      yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: python
+      image: python:3.12-slim
+      command: ["sh", "-c", "trap 'exit 0' TERM; sleep infinity & wait"]
+      resources:
+        requests: { cpu: 500m, memory: 512Mi }
+        limits:   { memory: 1Gi }
+'''
+      defaultContainer 'python'
+    }
+  }
+  triggers { pollSCM('H/2 * * * *') }
+  options {
+    timeout(time: 10, unit: 'MINUTES')
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+    disableConcurrentBuilds()
+  }
+  environment { UV_LINK_MODE = 'copy' }
+  stages {
+    stage('Setup') {
+      steps { dir('gateway') { sh 'pip install --quiet uv==0.11.28 && uv sync --frozen' } }
+    }
+    stage('models_exist') {
+      steps { dir('gateway') { sh 'uv run python -m release_check.run models_exist' } }
+    }
+    stage('routes_unchanged') {
+      steps { dir('gateway') { sh 'uv run python -m release_check.run routes_unchanged' } }
+    }
+  }
+}

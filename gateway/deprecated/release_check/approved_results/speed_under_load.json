@@ -1,5 +1,5 @@
 {
-  "stage": "load",
+  "check": "speed_under_load",
   "metrics": {
     "requests": 608,
     "rps": 20.3,

@@ -4,6 +4,6 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 reports/
-.qualify-cache/
+.release-check-cache/
 .coverage
 coverage.xml

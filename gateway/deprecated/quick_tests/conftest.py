@@ -1,4 +1,4 @@
-import json
+"""Shared test setup. pytest loads this file automatically (the name conftest.py is required)."""
 
 import pytest
 from fastapi.testclient import TestClient
@@ -9,7 +9,9 @@ from gateway.providers.mock_provider import MockProvider
 
 
 @pytest.fixture(autouse=True)
-def fast_mock(monkeypatch):
+def no_delay_and_no_real_api_keys(monkeypatch):
+    """Runs before every test: the mock model answers instantly, and real provider keys
+    from your shell are hidden so no test ever calls a paid API."""
     monkeypatch.setattr(MockProvider, "delay_s", 0)
     for env in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"):
         monkeypatch.delenv(env, raising=False)
@@ -17,6 +19,8 @@ def fast_mock(monkeypatch):
 
 @pytest.fixture
 def make_client(tmp_path):
+    """Returns a function that builds a test gateway with a fresh SQLite database.
+    Pass settings to change it, e.g. make_client(cache_class=...)."""
     def _make(**overrides) -> TestClient:
         settings = Settings(
             database_url=f"sqlite+aiosqlite:///{tmp_path}/test.db",
@@ -32,24 +36,6 @@ def make_client(tmp_path):
 
 @pytest.fixture
 def client(make_client):
+    """A test gateway with default settings: no cache, no router."""
     with make_client() as c:
         yield c
-
-
-def parse_sse(body: str) -> list[tuple[str, dict]]:
-    out = []
-    for block in body.strip().split("\n\n"):
-        lines = dict(line.split(": ", 1) for line in block.splitlines())
-        out.append((lines["event"], json.loads(lines["data"])))
-    return out
-
-
-def run_chat(client: TestClient, message: str, conversation_id=None, **settings) -> list[tuple[str, dict]]:
-    body = {
-        "conversation_id": conversation_id,
-        "message": message,
-        "settings": {"provider": "mock", "model": "echo", **settings},
-    }
-    r = client.post("/api/chat", json=body)
-    assert r.status_code == 200, r.text
-    return parse_sse(r.text)

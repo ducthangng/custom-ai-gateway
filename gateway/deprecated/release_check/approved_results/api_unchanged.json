@@ -1,5 +1,5 @@
 {
-  "stage": "contract",
+  "check": "api_unchanged",
   "metrics": {
     "paths": 11,
     "breaking_changes": 0

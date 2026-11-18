@@ -1,0 +1,70 @@
+// Release check: runs the 2 checks of release_check/ and compares each with release_check/approved_results.
+// One Jenkins stage per check, cheapest first; the first failure stops the run.
+// A check whose inputs did not change since a passing run is skipped (results cached on PVC qualify-cache).
+// At the end, release_check.report lists only what got worse, with evidence.
+
+def podYaml() {
+  return '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: python
+      image: python:3.12-slim
+      command: ["sh", "-c", "trap 'exit 0' TERM; sleep infinity & wait"]
+      resources:
+        requests: { cpu: 500m, memory: 512Mi }
+        limits:   { memory: 1536Mi }
+      volumeMounts:
+        - { name: check-cache, mountPath: /cache }
+  volumes:
+    - name: check-cache
+      persistentVolumeClaim: { claimName: qualify-cache }
+'''
+}
+
+// Run one check from release_check/checks.py.
+def runCheck(String check) {
+  def cache = params.NO_CACHE ? '' : '--cache-dir /cache'
+  dir('gateway') {
+    sh "uv run python -m release_check.run --check ${check} --scenario ${params.SCENARIO} --out reports/release_check ${cache}"
+  }
+}
+
+pipeline {
+  agent {
+    kubernetes {
+      yaml podYaml()
+      defaultContainer 'python'
+    }
+  }
+  parameters {
+    choice(name: 'SCENARIO', choices: ['clean', 'broken_config', 'worse_routing'],
+           description: 'clean = the code as it is; broken_config / worse_routing = practice bugs in release_check/practice_scenarios/')
+    booleanParam(name: 'NO_CACHE', defaultValue: false, description: 'run every check even if its inputs did not change')
+  }
+  triggers { pollSCM('H/2 * * * *') }
+  options {
+    timeout(time: 20, unit: 'MINUTES')
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+    disableConcurrentBuilds()
+  }
+  environment {
+    UV_LINK_MODE = 'copy'
+  }
+  stages {
+    stage('Setup') {
+      steps { dir('gateway') { sh 'pip install --quiet uv==0.11.28 && uv sync --frozen && rm -rf reports/release_check' } }
+    }
+    stage('config_is_valid')   { steps { runCheck('config_is_valid') } }
+    stage('routing_unchanged') { steps { runCheck('routing_unchanged') } }
+  }
+  post {
+    always {
+      dir('gateway') {
+        sh 'uv run python -m release_check.report --results reports/release_check --out reports/release_check --no-fail || true'
+      }
+      archiveArtifacts artifacts: 'gateway/reports/release_check/**', allowEmptyArchive: true
+    }
+  }
+}

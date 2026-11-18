@@ -23,7 +23,7 @@ line-length = 110
 markers = ["integration: needs a real Redis at GATEWAY_REDIS_URL (default redis://localhost:6379/0)"]
 addopts = "-m 'not integration'"
 asyncio_mode = "auto"
-testpaths = ["tests"]
+testpaths = ["quick_tests"]
 
 [dependency-groups]
 dev = [

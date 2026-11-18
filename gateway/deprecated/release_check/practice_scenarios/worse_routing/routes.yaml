@@ -1,4 +1,4 @@
-# SCENARIO bad: broken config (unquoted null keyword, regex that does not compile, unknown model)
+# Practice scenario worse_routing: a valid routes.yaml, but code keywords removed (python, rust, docker, kubectl, redis, git, commit, stash, npm) -> routing regressions
 # JJ, the built-in router (gateway/plugins/rules_router.py). Enable with
 #   GATEWAY_ROUTER_CLASS=gateway.plugins.rules_router:RulesRouter   (GATEWAY_ROUTES_PATH, default routes.yaml)
 #
@@ -17,19 +17,18 @@ min_score: 1
 routes:
   - name: code
     target:
-      candidates: [anthropic/claude-sonnet-5-5, openai/gpt-5, gemini/gemini-2.5-pro, mock/echo, openai/gpt-404]
+      candidates: [anthropic/claude-sonnet-5-5, openai/gpt-5, gemini/gemini-2.5-pro, mock/echo]
       params: { level: high, temperature: 0.2 }
     keywords: [
-      python, golang, go program, goroutine, rust, typescript, javascript, nodejs, node, react, java,
+      golang, go program, goroutine, typescript, javascript, nodejs, node, react, java,
       sql, css, tailwind, flexbox, html, json, csv, yaml, regex, api, fastapi, django, flask, pandas,
-      numpy, docker, kubectl, kubernetes, nginx, redis, git, commit, merge, rebase, stash, npm, pip,
+      numpy, kubernetes, nginx, merge, rebase, pip,
       uv, vitest, pytest, compile, compiler, stack trace, function, struct, class, variable, module,
-      bug, debug, debugging, deadlock, memory leak, pointer, null, segfault, syntax, exception,
+      bug, debug, debugging, deadlock, memory leak, pointer, "null", segfault, syntax, exception,
       middleware, cors, ssl, http, endpoint, script, code, deepcopy, borrow checker, lifetime,
       requirements.txt, systemctl, logs, ttl, mock, useeffect, decimal places, format float
     ]
     patterns:
-      - '(unclosed[group'
       - '\b\w+(Error|Exception)\b'            # TypeError, NullPointerException, ...
       - '(?i)\b(panic|fatal|segmentation fault):'
       - '\bexit(ed)? (with )?code \d+'

@@ -1,8 +1,9 @@
-"""The five qualification stages. Each returns a Result; qualify.run handles caching, golden
-comparison and writing <stage>.log / <stage>.json.
+"""The 5 release checks. Each one takes a Scenario and returns a CheckResult;
+release_check.run takes care of caching, comparing with approved results and writing files.
 
-Cost order (fail fast): config_lint (<1 s) -> contract (~1 s) -> routing (<1 s) -> cache (~1 s)
--> load (LOAD_SECONDS, default 30 s, starts the real gateway with uvicorn).
+They run cheapest first, and the first failure stops the run:
+  config_is_valid (<1 s) -> api_unchanged (~1 s) -> routing_unchanged (<1 s) -> cache_works (~1 s)
+  -> speed_under_load (LOAD_SECONDS, default 30 s, starts the real gateway with uvicorn)
 """
 
 import asyncio
@@ -29,39 +30,45 @@ OVERRIDABLE_PARAMS = {"temperature", "top_p", "max_tokens", "level"}
 
 
 @dataclass
-class Result:
+class CheckResult:
+    """What one check found: numbers (metrics), problems (failures) and a log for humans."""
     metrics: dict = field(default_factory=dict)
     failures: list = field(default_factory=list)     # [{id, message, evidence, line}]
-    evidence: dict = field(default_factory=dict)     # metric -> evidence line
+    evidence: dict = field(default_factory=dict)     # metric -> one line that explains the number
     lines: list = field(default_factory=list)
 
     def log(self, msg: str) -> int:
+        """Add one line to the log and return its line number."""
         self.lines.append(msg)
         return len(self.lines)
 
     def fail(self, fid: str, message: str) -> None:
+        """Record a problem. fid must stay the same across runs, so known problems can be recognised."""
         line = self.log(f"FAIL {message}")
         self.failures.append({"id": fid, "message": message, "evidence": f"FAIL {message}", "line": line})
 
 
 @dataclass
-class Ctx:
+class Scenario:
+    """What is being tested: which routes.yaml, which env overrides, and where the approved results are."""
     routes_path: str
     env: dict                    # scenario env overrides, applied to child processes and lookups
-    golden_dir: Path
+    approved_dir: Path
     catalog_path: str = "catalog.yaml"
 
     def getenv(self, key: str, default: str) -> str:
+        """Read an env var, letting the scenario's own value win."""
         return self.env.get(key, os.getenv(key, default))
 
 
-def _hid(text: str) -> str:
+def _short_hash(text: str) -> str:
+    """10-character hash, used to build a stable failure id from a long text."""
     return hashlib.sha256(text.encode()).hexdigest()[:10]
 
 
 @contextlib.contextmanager
-def _env(**kv):
-    """Temporarily set env vars (plugins are built with zero args and read their config from env)."""
+def _temporary_env(**kv):
+    """Set env vars only inside a `with` block (plugins read their settings from env)."""
     old = {k: os.environ.get(k) for k in kv}
     os.environ.update({k: str(v) for k, v in kv.items()})
     try:
@@ -74,19 +81,21 @@ def _env(**kv):
                 os.environ[k] = v
 
 
-def _test_app(ctx: Ctx, db_dir: str, cache_class: str | None = None, **settings):
-    """In-process gateway: SQLite, mock provider without delay, JJ router on the scenario's routes."""
+def _build_test_gateway(scenario: Scenario, db_dir: str, cache_class: str | None = None, **settings):
+    """A gateway app running in this process: SQLite, a mock model with no delay, and the JJ router
+    using the scenario's routes.yaml."""
     from gateway.config import Settings
     from gateway.main import create_app
     from gateway.providers.mock_provider import MockProvider
 
     MockProvider.delay_s = 0
-    s = Settings(database_url=f"sqlite+aiosqlite:///{db_dir}/q.db", catalog_path=ctx.catalog_path,
+    s = Settings(database_url=f"sqlite+aiosqlite:///{db_dir}/q.db", catalog_path=scenario.catalog_path,
                  static_dir=f"{db_dir}/no-ui", router_class=ROUTER, cache_class=cache_class, **settings)
     return create_app(s)
 
 
-def _chat(client, message: str, routing: str = "auto") -> list[tuple[str, dict]]:
+def _send_chat(client, message: str, routing: str = "auto") -> list[tuple[str, dict]]:
+    """POST one chat and return its stream as a list of (event name, data)."""
     r = client.post("/api/chat", json={"message": message, "settings": {
         "provider": "mock", "model": "echo", "routing": routing}})
     if r.status_code != 200:
@@ -98,17 +107,19 @@ def _chat(client, message: str, routing: str = "auto") -> list[tuple[str, dict]]
     return out
 
 
-# ---------------------------------------------------------------- 1. config_lint
-def config_lint(ctx: Ctx) -> Result:
+# ---------------------------------------------------------------- 1. config_is_valid
+def config_is_valid(scenario: Scenario) -> CheckResult:
+    """Read routes.yaml and catch mistakes before anything runs: bad YAML, models that are not in
+    catalog.yaml, keywords that are not text, regex patterns that do not compile."""
     from gateway.catalog import load_catalog
 
-    res = Result()
+    res = CheckResult()
     try:
-        cfg = yaml.safe_load(Path(ctx.routes_path).read_text())
+        cfg = yaml.safe_load(Path(scenario.routes_path).read_text())
     except yaml.YAMLError as e:
         res.fail("yaml", f"routes.yaml is not valid YAML: {e}")
         return res
-    catalog = load_catalog(ctx.catalog_path)
+    catalog = load_catalog(scenario.catalog_path)
     if "routes" not in cfg:
         res.fail("missing:routes", "top-level key 'routes' missing")
     if not isinstance(cfg.get("min_score", 1), int) or cfg.get("min_score", 1) < 1:
@@ -138,28 +149,32 @@ def config_lint(ctx: Ctx) -> Result:
             try:
                 re.compile(p)
             except (re.error, TypeError) as e:
-                res.fail(f"regex:{name}:{_hid(str(p))}", f"route '{name}': pattern {p!r} does not compile: {e}")
+                res.fail(f"regex:{name}:{_short_hash(str(p))}",
+                         f"route '{name}': pattern {p!r} does not compile: {e}")
     res.metrics = {"routes": len(names), "errors": len(res.failures)}
-    res.log(f"checked {len(names)} routes against {ctx.catalog_path}, {len(res.failures)} errors")
+    res.log(f"checked {len(names)} routes against {scenario.catalog_path}, {len(res.failures)} errors")
     return res
 
 
-# ---------------------------------------------------------------- 2. contract
-def _schema_fields(openapi: dict) -> dict:
+# ---------------------------------------------------------------- 2. api_unchanged
+def _api_shape(openapi: dict) -> dict:
+    """Boil an OpenAPI spec down to what clients depend on: endpoints, fields, required fields."""
     schemas = openapi.get("components", {}).get("schemas", {})
     return {"paths": sorted(f"{m.upper()} {p}" for p, ops in openapi["paths"].items() for m in ops),
             "schemas": {n: sorted(s.get("properties", {})) for n, s in schemas.items()},
             "required": {n: sorted(s.get("required", [])) for n, s in schemas.items()}}
 
 
-def contract(ctx: Ctx) -> Result:
+def api_unchanged(scenario: Scenario) -> CheckResult:
+    """Make sure the API did not break for the web UI: no endpoint or field removed, no new required
+    field, and a real chat still streams meta -> text -> done."""
     from fastapi.testclient import TestClient
 
-    res = Result()
-    with tempfile.TemporaryDirectory() as tmp, _env(GATEWAY_ROUTES_PATH=ctx.routes_path):
-        app = _test_app(ctx, tmp, cache_class="gateway.plugins.cache:MemoryCache")
-        now = _schema_fields(app.openapi())
-        was = _schema_fields(json.loads((ctx.golden_dir / "openapi.json").read_text()))
+    res = CheckResult()
+    with tempfile.TemporaryDirectory() as tmp, _temporary_env(GATEWAY_ROUTES_PATH=scenario.routes_path):
+        app = _build_test_gateway(scenario, tmp, cache_class="gateway.plugins.cache:MemoryCache")
+        now = _api_shape(app.openapi())
+        was = _api_shape(json.loads((scenario.approved_dir / "openapi.json").read_text()))
         for p in sorted(set(was["paths"]) - set(now["paths"])):
             res.fail(f"path:{p}", f"endpoint removed: {p}")
         for name, props in was["schemas"].items():
@@ -170,7 +185,7 @@ def contract(ctx: Ctx) -> Result:
                 res.fail(f"req:{name}.{prop}", f"schema {name}: '{prop}' became required (breaks the UI)")
 
         with TestClient(app) as c:
-            ev = _chat(c, "python TypeError in my script")
+            ev = _send_chat(c, "python TypeError in my script")
             names = [e for e, _ in ev]
             model = next((d for e, d in ev if e == "model"), {})
             done = ev[-1][1] if names and names[-1] == "done" else {}
@@ -195,73 +210,78 @@ def contract(ctx: Ctx) -> Result:
     return res
 
 
-# ---------------------------------------------------------------- 3. routing
-def routing(ctx: Ctx) -> Result:
+# ---------------------------------------------------------------- 3. routing_unchanged
+def routing_unchanged(scenario: Scenario) -> CheckResult:
+    """Ask JJ to route 100 fixed prompts and compare with the approved decisions.
+    A prompt that now goes to the wrong route is a failure; one that got fixed is just logged."""
     from gateway.routing import RuleClassifier, load_routes
 
-    res = Result()
-    clf = RuleClassifier(load_routes(ctx.routes_path))
+    res = CheckResult()
+    clf = RuleClassifier(load_routes(scenario.routes_path))
     prompts = []
     for f in ("evals/dev.jsonl", "evals/test.jsonl"):
         with open(f) as fh:
             prompts += [json.loads(line) for line in fh if line.strip()]
-    golden = json.loads((ctx.golden_dir / "routing_decisions.json").read_text())
+    approved = json.loads((scenario.approved_dir / "routing_decisions.json").read_text())
     correct = changed = improved = 0
     decisions = {}
     for d in prompts:
         pred = clf.classify(d["prompt"]).route
         decisions[d["prompt"]] = pred
         correct += pred == d["label"]
-        was = golden.get(d["prompt"])
+        was = approved.get(d["prompt"])
         if was is not None and was != pred:
             changed += 1
             if pred == d["label"]:
                 improved += 1
                 res.log(f"improved: {d['prompt']!r} {was} -> {pred}")
             else:
-                res.fail(f"route:{_hid(d['prompt'])}", f"{d['prompt']!r}: was {was}, now {pred} (label {d['label']})")
+                res.fail(f"route:{_short_hash(d['prompt'])}",
+                         f"{d['prompt']!r}: was {was}, now {pred} (label {d['label']})")
     res.metrics = {"accuracy": round(correct / len(prompts), 4), "changed": changed, "improved": improved}
     res.evidence["accuracy"] = f"accuracy {res.metrics['accuracy']:.1%} on {len(prompts)} fixed prompts"
-    res.log(res.evidence["accuracy"] + f", {changed} decisions changed vs golden ({improved} improved)")
-    res.decisions = decisions                        # used by --write-golden
+    res.log(res.evidence["accuracy"] + f", {changed} decisions changed vs approved ({improved} improved)")
+    res.decisions = decisions                        # saved by --approve
     return res
 
 
-# ---------------------------------------------------------------- 4. cache
-def cache(ctx: Ctx) -> Result:
-    """Exact cache through the real pipeline: a repeated request must be served from Redis with no
-    model call, and a dead Redis must not break chats (fail-open)."""
+# ---------------------------------------------------------------- 4. cache_works
+def cache_works(scenario: Scenario) -> CheckResult:
+    """Send the same prompts twice: the second time must come from Redis without calling the model.
+    Then make Redis unreachable: chats must still work, just without the cache."""
     from unittest import mock
 
     from fakeredis import FakeAsyncRedis
     from fastapi.testclient import TestClient
 
-    res = Result()
+    res = CheckResult()
     with open("evals/dev.jsonl") as fh:
         prompts = [json.loads(line)["prompt"] for line in fh if line.strip()][:20]
     shared = FakeAsyncRedis(decode_responses=True)
-    with (tempfile.TemporaryDirectory() as tmp, _env(GATEWAY_ROUTES_PATH=ctx.routes_path),
+    with (tempfile.TemporaryDirectory() as tmp, _temporary_env(GATEWAY_ROUTES_PATH=scenario.routes_path),
           mock.patch("gateway.plugins.redis_cache.aioredis.Redis.from_url", lambda *a, **k: shared),
-          TestClient(_test_app(ctx, tmp, cache_class=REDIS_CACHE, cache_timeout_s=1.0)) as c):
-        first = [_chat(c, p)[-1][1] for p in prompts]
-        second = [_chat(c, p)[-1][1] for p in prompts]
-        other_mode = [_chat(c, p, routing="manual")[-1][1] for p in prompts[:5]]
+          TestClient(_build_test_gateway(scenario, tmp, cache_class=REDIS_CACHE, cache_timeout_s=1.0)) as c):
+        first = [_send_chat(c, p)[-1][1] for p in prompts]
+        second = [_send_chat(c, p)[-1][1] for p in prompts]
+        other_mode = [_send_chat(c, p, routing="manual")[-1][1] for p in prompts[:5]]
     for p, d in zip(prompts, second, strict=True):
         if d.get("cache_status") != "hit":
-            res.fail(f"miss:{_hid(p)}", f"repeat of {p!r} was not a cache hit (cache_status={d.get('cache_status')})")
+            res.fail(f"miss:{_short_hash(p)}",
+                     f"repeat of {p!r} was not a cache hit (cache_status={d.get('cache_status')})")
         elif d.get("output_tokens"):
-            res.fail(f"tokens:{_hid(p)}", f"cache hit for {p!r} still reported {d['output_tokens']} output tokens")
+            res.fail(f"tokens:{_short_hash(p)}",
+                     f"cache hit for {p!r} still reported {d['output_tokens']} output tokens")
     for p, d in zip(prompts[:5], other_mode, strict=True):
         if d.get("cache_status") == "hit":
-            res.fail(f"mode:{_hid(p)}", f"manual request for {p!r} reused the auto-mode entry")
+            res.fail(f"mode:{_short_hash(p)}", f"manual request for {p!r} reused the auto-mode entry")
 
     with (tempfile.TemporaryDirectory() as tmp,
-          _env(GATEWAY_ROUTES_PATH=ctx.routes_path, GATEWAY_REDIS_URL="redis://127.0.0.1:1/0"),
-          TestClient(_test_app(ctx, tmp, cache_class=REDIS_CACHE, cache_timeout_s=0.2)) as c):
-        down = [_chat(c, p)[-1] for p in prompts[:5]]
+          _temporary_env(GATEWAY_ROUTES_PATH=scenario.routes_path, GATEWAY_REDIS_URL="redis://127.0.0.1:1/0"),
+          TestClient(_build_test_gateway(scenario, tmp, cache_class=REDIS_CACHE, cache_timeout_s=0.2)) as c):
+        down = [_send_chat(c, p)[-1] for p in prompts[:5]]
     for (event, d), p in zip(down, prompts[:5], strict=True):
         if event != "done" or d.get("status") != "ok":
-            res.fail(f"failopen:{_hid(p)}", f"Redis down: {p!r} ended with {event} {d}")
+            res.fail(f"failopen:{_short_hash(p)}", f"Redis down: {p!r} ended with {event} {d}")
 
     n = len(prompts)
     res.metrics = {
@@ -277,14 +297,16 @@ def cache(ctx: Ctx) -> Result:
     return res
 
 
-# ---------------------------------------------------------------- 5. load
-def _free_port() -> int:
+# ---------------------------------------------------------------- 5. speed_under_load
+def _find_free_port() -> int:
+    """Ask the OS for a TCP port nobody is using."""
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
 
-def _wait(url: str, timeout_s: float = 30) -> None:
+def _wait_until_up(url: str, timeout_s: float = 30) -> None:
+    """Poll url until it answers 200, or give up after timeout_s."""
     import httpx
     deadline = time.time() + timeout_s
     while time.time() < deadline:
@@ -297,11 +319,11 @@ def _wait(url: str, timeout_s: float = 30) -> None:
     raise RuntimeError(f"{url} did not come up")
 
 
-async def _drive(url: str, seconds: float, concurrency: int, rps: float,
-                 prompts: list[str]) -> list[tuple[int, str, float, float]]:
-    """Paced: each worker sends one chat every concurrency/rps seconds, so the offered load is fixed
-    and latency measures the gateway, not how fast this laptop can fire requests.
-    Rows: (http status, final SSE event, ms to the last event, t since start)."""
+async def _send_steady_traffic(url: str, seconds: float, concurrency: int, rps: float,
+                               prompts: list[str]) -> list[tuple[int, str, float, float]]:
+    """Send chats at a fixed rate (rps) from `concurrency` workers, so latency measures the gateway
+    and not how fast this machine can fire requests.
+    Rows: (http status, last SSE event, ms until the last event, seconds since start)."""
     import httpx
     out: list[tuple[int, str, float, float]] = []
     rng = random.Random(42)
@@ -310,6 +332,7 @@ async def _drive(url: str, seconds: float, concurrency: int, rps: float,
     interval = concurrency / rps
 
     async def worker(i: int):
+        """One worker: send a chat, wait for its turn, repeat until time is up."""
         nxt = start + i * interval / concurrency
         async with httpx.AsyncClient(base_url=url, timeout=30) as c:
             while (now := time.perf_counter()) < stop:
@@ -332,28 +355,33 @@ async def _drive(url: str, seconds: float, concurrency: int, rps: float,
     return out
 
 
-def load(ctx: Ctx) -> Result:
-    res = Result()
-    seconds = float(ctx.getenv("LOAD_SECONDS", "30"))
-    concurrency = int(ctx.getenv("LOAD_CONCURRENCY", "8"))
-    rps = float(ctx.getenv("LOAD_RPS", "20"))
-    warmup = float(ctx.getenv("LOAD_WARMUP_S", "3"))
-    redis_url = ctx.getenv("GATEWAY_REDIS_URL", "redis://localhost:6379/0")
-    port = _free_port()
+def speed_under_load(scenario: Scenario) -> CheckResult:
+    """Start the real gateway (uvicorn + Redis) and send steady traffic for LOAD_SECONDS.
+    Reports p50/p95 latency and error rate; slower than allowed or any errors -> fail."""
+    res = CheckResult()
+    seconds = float(scenario.getenv("LOAD_SECONDS", "30"))
+    concurrency = int(scenario.getenv("LOAD_CONCURRENCY", "8"))
+    rps = float(scenario.getenv("LOAD_RPS", "20"))
+    warmup = float(scenario.getenv("LOAD_WARMUP_S", "3"))
+    redis_url = scenario.getenv("GATEWAY_REDIS_URL", "redis://localhost:6379/0")
+    port = _find_free_port()
     with tempfile.TemporaryDirectory() as tmp:
-        db = ctx.getenv("QUALIFY_DATABASE_URL", f"sqlite+aiosqlite:///{tmp}/load.db")
-        env = {**os.environ, **ctx.env, "GATEWAY_DATABASE_URL": db, "GATEWAY_ROUTES_PATH": ctx.routes_path,
-               "GATEWAY_ROUTER_CLASS": ROUTER, "GATEWAY_CACHE_CLASS": REDIS_CACHE, "GATEWAY_REDIS_URL": redis_url,
-               "GATEWAY_STATIC_DIR": f"{tmp}/no-ui", "GATEWAY_MOCK_DELAY_S": ctx.getenv("GATEWAY_MOCK_DELAY_S", "0.002")}
+        db = scenario.getenv("RELEASE_CHECK_DATABASE_URL", f"sqlite+aiosqlite:///{tmp}/load.db")
+        env = {**os.environ, **scenario.env, "GATEWAY_DATABASE_URL": db,
+               "GATEWAY_ROUTES_PATH": scenario.routes_path, "GATEWAY_ROUTER_CLASS": ROUTER,
+               "GATEWAY_CACHE_CLASS": REDIS_CACHE, "GATEWAY_REDIS_URL": redis_url,
+               "GATEWAY_STATIC_DIR": f"{tmp}/no-ui",
+               "GATEWAY_MOCK_DELAY_S": scenario.getenv("GATEWAY_MOCK_DELAY_S", "0.002")}
         proc = subprocess.Popen([sys.executable, "-m", "uvicorn", "gateway.main:app", "--port", str(port),
                                  "--log-level", "warning"], env=env)
         try:
-            _wait(f"http://127.0.0.1:{port}/api/healthz")
+            _wait_until_up(f"http://127.0.0.1:{port}/api/healthz")
             import redis
             redis.Redis.from_url(redis_url).flushdb()
             with open("evals/dev.jsonl") as fh:
                 prompts = [json.loads(line)["prompt"] for line in fh if line.strip()][:30]
-            rows = asyncio.run(_drive(f"http://127.0.0.1:{port}", seconds + warmup, concurrency, rps, prompts))
+            rows = asyncio.run(_send_steady_traffic(f"http://127.0.0.1:{port}", seconds + warmup,
+                                                    concurrency, rps, prompts))
             rows = [r for r in rows if r[3] >= warmup]
         finally:
             proc.terminate()
@@ -375,25 +403,28 @@ def load(ctx: Ctx) -> Result:
     return res
 
 
-STAGES = {"config_lint": config_lint, "contract": contract, "routing": routing, "cache": cache, "load": load}
+# The checks, in the order they run.
+CHECKS = {"config_is_valid": config_is_valid, "api_unchanged": api_unchanged,
+          "routing_unchanged": routing_unchanged, "cache_works": cache_works, "speed_under_load": speed_under_load}
 
-# Tolerances written into golden/<stage>.json at --write-golden time.
-COMPARE = {
-    "routing": {"accuracy": {"better": "higher", "abs": 0.02}},
-    "cache": {"repeat_hit_rate": {"better": "higher", "abs": 0.0},
-              "fail_open_ok_rate": {"better": "higher", "abs": 0.0}},
+# How much worse than approved a metric may get. Written into approved_results/<check>.json by --approve.
+TOLERANCES = {
+    "routing_unchanged": {"accuracy": {"better": "higher", "abs": 0.02}},
+    "cache_works": {"repeat_hit_rate": {"better": "higher", "abs": 0.0},
+                    "fail_open_ok_rate": {"better": "higher", "abs": 0.0}},
     # laptop vs CI pod timings differ: generous on latency, strict on correctness.
-    "load": {"p95_ms": {"better": "lower", "rel": 1.0, "abs": 50}, "error_rate": {"better": "lower", "abs": 0.01}},
+    "speed_under_load": {"p95_ms": {"better": "lower", "rel": 1.0, "abs": 50},
+                         "error_rate": {"better": "lower", "abs": 0.01}},
 }
 
-# Files whose content decides the result. Unchanged inputs -> reuse the cached passing result.
-# (qualify/stages.py + qualify/compare.py are added to every stage by qualify.run.inputs_key)
-CODE = ["gateway/*.py", "gateway/*/*.py"]
-INPUTS = {
-    "config_lint": ["{routes}", "catalog.yaml"],
-    "contract": [*CODE, "catalog.yaml", "{golden}/openapi.json"],
-    "routing": ["{routes}", "gateway/routing/*.py", "evals/dev.jsonl", "evals/test.jsonl",
-                "{golden}/routing_decisions.json"],
-    "cache": ["{routes}", *CODE, "evals/dev.jsonl"],
-    "load": ["{routes}", *CODE, "catalog.yaml"],
+# Files that decide each check's result. If none changed since a passing run, the check is skipped.
+# (checks.py and compare.py are added to every check by release_check.run.fingerprint_inputs)
+GATEWAY_CODE = ["gateway/*.py", "gateway/*/*.py"]
+INPUT_FILES = {
+    "config_is_valid": ["{routes}", "catalog.yaml"],
+    "api_unchanged": [*GATEWAY_CODE, "catalog.yaml", "{approved}/openapi.json"],
+    "routing_unchanged": ["{routes}", "gateway/routing/*.py", "evals/dev.jsonl", "evals/test.jsonl",
+                          "{approved}/routing_decisions.json"],
+    "cache_works": ["{routes}", *GATEWAY_CODE, "evals/dev.jsonl"],
+    "speed_under_load": ["{routes}", *GATEWAY_CODE, "catalog.yaml"],
 }

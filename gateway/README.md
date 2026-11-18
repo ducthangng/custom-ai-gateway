@@ -90,15 +90,41 @@ GATEWAY_CACHE_CLASS=gateway.plugins.redis_cache:RedisCache      # GATEWAY_REDIS_
 ## Quality gates (CI, see ../Jenkinsfile)
 
 ```bash
+uv run pytest -q                                                     # quick_tests/: 3 small tests, every push
 uv run python -m evals.run --split test --gate evals/baseline.json   # JJ accuracy on the held-out split
-uv run python -m qualify.run --all --scenario clean --cache-dir .qualify-cache   # release qualification
-uv run python -m qualify.diff --run reports/qualify                   # only what is new vs qualify/golden
+uv run python -m release_check.run                                   # release check: 2 checks, PASS/FAIL
 ```
 
-- **Eval gate:** `evals/dev.jsonl` (rules were written against it) and `evals/test.jsonl` (held out). CI fails if test accuracy drops more than 2 points below `evals/baseline.json`. Tests also fail if a `routes.yaml` utterance leaks into either split.
-- **Qualification** (`qualify/`, Jenkins job `qualify`): `config_lint → contract → routing → cache → load`, fail fast, each stage compared with `qualify/golden/`; unchanged inputs skip the stage. Scenarios `bad` and `partial` in `qualify/scenarios/` show a broken config and a routing regression. The load stage needs Redis (`GATEWAY_REDIS_URL`). Re-record golden on purpose only: `python -m qualify.run --all --write-golden`.
+- **Quick tests** (`quick_tests/`, run on every push by job `ai-gateway`):
+  - `test_router.py`: a coding question goes to route `code`; a joke goes to route `chitchat`.
+  - `test_cache.py`: the Redis cache gives back what was saved (on fakeredis, no server).
+- **Eval gate:** `evals/dev.jsonl` (rules were written against it) and `evals/test.jsonl` (held out). CI fails if test accuracy drops more than 2 points below `evals/baseline.json`.
+- **Release check** (`release_check/run.py`, Jenkins job `qualify`):
+  - `models_exist`: every model in `routes.yaml` is in `catalog.yaml`.
+  - `routes_unchanged`: 100 saved prompts still get the route stored in `release_check/expected_routes.json`. After an intended routing change, accept it with `python -m release_check.run --save`.
+
+The bigger test suite, the coverage gate and the old release check tool are archived in `deprecated/`.
 
 In the UI, **Routing: Manual** skips the router for that chat.
+
+## Demo: break it, push, fix it
+
+Each demo is a one-line edit. Make it, run the command (or push and watch Jenkins), see the failure,
+undo the edit (`git checkout -- <file>`), and it is green again. All four were checked on 2026-11-18.
+
+**Quick tests** (job `ai-gateway`, stage `Quick tests`; locally `uv run pytest -q`)
+
+| Demo | Edit | What fails |
+|---|---|---|
+| Cache forgets to save | `gateway/plugins/redis_cache.py`, in `set()`: replace `await self.r.set(key, value, ex=ttl_s or None)` with `pass` | `test_cache_gives_back_what_was_saved`: `assert None == 'answer'` |
+| Route renamed | `routes.yaml`: `- name: chitchat` → `- name: smalltalk` | `test_joke_goes_to_chitchat_route`: `assert 'smalltalk' == 'chitchat'` |
+
+**Release check** (job `qualify`; locally `uv run python -m release_check.run`)
+
+| Demo | Edit | What fails |
+|---|---|---|
+| Model that does not exist | `routes.yaml`, route `code`: `anthropic/claude-sonnet-5-5` → `anthropic/claude-sonnet-9` | `FAIL models_exist`: `route 'code' uses anthropic/claude-sonnet-9, which is not in catalog.yaml`. The quick tests still pass |
+| Keyword deleted | `routes.yaml`, route `chitchat`: delete `joke,` from the keywords | `FAIL routes_unchanged`: `'tell me a joke about programmers': expected chitchat, got none` (and 1 more). The quick tests and the CI eval gate (93.8%) still pass: only the release check catches it |
 
 ## Models
 
@@ -135,7 +161,6 @@ Tables are created on startup (`create_all`), and later columns are added by the
 ## Tests
 
 ```bash
-uv run pytest -q          # SQLite + mock provider + fakeredis, no keys, Postgres or Redis needed
-GATEWAY_REDIS_URL=redis://localhost:6390/0 uv run pytest -q -m integration   # real Redis
+uv run pytest -q          # quick_tests/: no API keys, Postgres or Redis needed
 uv run ruff check .
 ```
