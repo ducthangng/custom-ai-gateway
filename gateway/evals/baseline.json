@@ -1,0 +1,7 @@
+{
+  "split": "test",
+  "accuracy": 0.9375,
+  "tolerance": 0.02,
+  "cfg_version": "b62c31004449",
+  "n": 48
+}

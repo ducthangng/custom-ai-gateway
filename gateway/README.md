@@ -74,7 +74,29 @@ class SemanticRouter:
                              params={"level": "low"}, reason="small talk", score=0.82)
 ```
 
-Return `None` to keep the user's model. The gateway ignores a decision whose model isn't in `catalog.yaml` or whose provider has no key. Param overrides are fitted to the chosen model: unsupported levels fall back to the model default, temperature is dropped for models that don't accept it, and `max_tokens` is capped. [examples/semantic_router_http.py](examples/semantic_router_http.py) shows how to call the existing semantic router in `../app` over HTTP.
+Return `None` to keep the user's model. The gateway ignores a decision whose model isn't in `catalog.yaml` or whose provider has no key. Param overrides are fitted to the chosen model: unsupported levels fall back to the model default, temperature is dropped for models that don't accept it, and `max_tokens` is capped. [examples/semantic_router_http.py](examples/semantic_router_http.py) shows the shape of a router that calls an external HTTP service.
+
+### Built-in plugins
+
+```bash
+GATEWAY_ROUTER_CLASS=gateway.plugins.rules_router:RulesRouter   # JJ, rules from routes.yaml (GATEWAY_ROUTES_PATH)
+GATEWAY_CACHE_CLASS=gateway.plugins.redis_cache:RedisCache      # GATEWAY_REDIS_URL=redis://localhost:6379/0
+```
+
+**JJ** ([gateway/routing/](gateway/routing/), [routes.yaml](routes.yaml)): each route has keywords (whole words, any case) and regexes; the route with the most distinct matches wins, ties go to the first route, and below `min_score` JJ returns `None`. A route lists candidate models (`provider/model` from `catalog.yaml`) in order of preference; the first whose provider has a key is used, with the route's `params` as overrides. The reason shown in the UI names the route, the matched words and the `routes.yaml` version.
+
+**RedisCache** ([gateway/plugins/redis_cache.py](gateway/plugins/redis_cache.py)) shares answers between replicas and survives restarts. Client retries are off on purpose: a slow Redis should cost one timeout and count as a miss.
+
+## Quality gates (CI, see ../Jenkinsfile)
+
+```bash
+uv run python -m evals.run --split test --gate evals/baseline.json   # JJ accuracy on the held-out split
+uv run python -m qualify.run --all --scenario clean --cache-dir .qualify-cache   # release qualification
+uv run python -m qualify.diff --run reports/qualify                   # only what is new vs qualify/golden
+```
+
+- **Eval gate:** `evals/dev.jsonl` (rules were written against it) and `evals/test.jsonl` (held out). CI fails if test accuracy drops more than 2 points below `evals/baseline.json`. Tests also fail if a `routes.yaml` utterance leaks into either split.
+- **Qualification** (`qualify/`, Jenkins job `qualify`): `config_lint → contract → routing → cache → load`, fail fast, each stage compared with `qualify/golden/`; unchanged inputs skip the stage. Scenarios `bad` and `partial` in `qualify/scenarios/` show a broken config and a routing regression. The load stage needs Redis (`GATEWAY_REDIS_URL`). Re-record golden on purpose only: `python -m qualify.run --all --write-golden`.
 
 In the UI, **Routing: Manual** skips the router for that chat.
 
@@ -113,6 +135,7 @@ Tables are created on startup (`create_all`), and later columns are added by the
 ## Tests
 
 ```bash
-uv run pytest -q          # SQLite + mock provider, no keys or Postgres needed
+uv run pytest -q          # SQLite + mock provider + fakeredis, no keys, Postgres or Redis needed
+GATEWAY_REDIS_URL=redis://localhost:6390/0 uv run pytest -q -m integration   # real Redis
 uv run ruff check .
 ```

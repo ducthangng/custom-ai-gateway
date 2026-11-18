@@ -1,0 +1,23 @@
+{
+  "stage": "cache",
+  "metrics": {
+    "first_pass_hit_rate": 0.0,
+    "repeat_hit_rate": 1.0,
+    "fail_open_ok_rate": 1.0
+  },
+  "failures": [],
+  "evidence": {
+    "repeat_hit_rate": "100% of 20 repeated prompts served from cache",
+    "fail_open_ok_rate": "100% of chats ok with Redis down"
+  },
+  "compare": {
+    "repeat_hit_rate": {
+      "better": "higher",
+      "abs": 0.0
+    },
+    "fail_open_ok_rate": {
+      "better": "higher",
+      "abs": 0.0
+    }
+  }
+}

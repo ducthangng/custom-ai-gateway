@@ -1,4 +1,5 @@
 import asyncio
+import os
 from collections.abc import AsyncIterator
 
 from gateway.catalog import ModelSpec
@@ -8,7 +9,7 @@ from gateway.providers.base import ChatMessage, GenParams, Provider, StreamEvent
 class MockProvider(Provider):
     """Offline provider that streams the prompt back. Handy for UI, cache and router tests."""
 
-    delay_s = 0.02
+    delay_s = float(os.getenv("GATEWAY_MOCK_DELAY_S", "0.02"))  # per streamed word
 
     @property
     def available(self) -> bool:

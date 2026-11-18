@@ -1,4 +1,4 @@
-"""Example router plugin: ask the existing semantic router service (app/ in this repo).
+"""Example router plugin: ask an external HTTP routing service (template; the built-in router is JJ, gateway/plugins/rules_router.py).
 
 The semantic router returns abstract targets such as {"model": "coder"}; ROUTE_MAP turns
 those into real catalog models. Run the gateway with:

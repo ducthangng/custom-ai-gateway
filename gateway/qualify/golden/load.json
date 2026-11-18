@@ -1,0 +1,27 @@
+{
+  "stage": "load",
+  "metrics": {
+    "requests": 608,
+    "rps": 20.3,
+    "p50_ms": 14.67,
+    "p95_ms": 17.92,
+    "mean_ms": 14.9,
+    "error_rate": 0.0
+  },
+  "failures": [],
+  "evidence": {
+    "p95_ms": "p95_ms=17.92 (608 chats, offered 20 rps, 30s)",
+    "error_rate": "error_rate=0.0 (608 chats, offered 20 rps, 30s)"
+  },
+  "compare": {
+    "p95_ms": {
+      "better": "lower",
+      "rel": 1.0,
+      "abs": 50
+    },
+    "error_rate": {
+      "better": "lower",
+      "abs": 0.01
+    }
+  }
+}

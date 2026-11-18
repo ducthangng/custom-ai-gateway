@@ -19,7 +19,7 @@ COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH" GATEWAY_STATIC_DIR=/app/static
 COPY gateway/gateway/ gateway/
 COPY gateway/examples/ examples/
-COPY gateway/catalog.yaml .
+COPY gateway/catalog.yaml gateway/routes.yaml ./
 COPY --from=web /web/dist/ static/
 RUN useradd -m appuser
 USER appuser
